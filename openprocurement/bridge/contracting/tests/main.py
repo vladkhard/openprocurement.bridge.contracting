@@ -23,6 +23,13 @@ from openprocurement.bridge.contracting.journal_msg_ids import (
     DATABRIDGE_COPY_CONTRACT_ITEMS,
     DATABRIDGE_MISSING_CONTRACT_ITEMS,
     DATABRIDGE_START,
+    DATABRIDGE_TENDER_PROCESS,
+    DATABRIDGE_WORKER_DIED,
+    DATABRIDGE_SKIP_NOT_MODIFIED,
+    DATABRIDGE_FOUND_NOLOT_COMPLETE,
+    DATABRIDGE_FOUND_MULTILOT_COMPLETE,
+    DATABRIDGE_SYNC_SLEEP,
+    DATABRIDGE_SYNC_RESUME,
 )
 
 class TestDatabridge(unittest.TestCase):
@@ -918,6 +925,216 @@ class TestDatabridge(unittest.TestCase):
                                                    extra=journal_context({"MESSAGE_ID": DATABRIDGE_EXCEPTION}, {}))
         self.assertEqual(mocked_logger.info.mock_calls, info_calls)
 
+    TENDER_ID = 'some_id'
+    DIRECTION = 'backward'
+
+    def _fake_response(self, status=None):
+        class Empty:
+            pass
+
+        response = Empty()
+        response.data = list()
+        response.next_page = Empty()
+        response.next_page.offset = True
+        return response
+
+    @patch('openprocurement.bridge.contracting.databridge.gevent')
+    @patch('openprocurement.bridge.contracting.databridge.logger')
+    @patch('openprocurement.bridge.contracting.databridge.Db')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClientSync')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClient')
+    @patch('openprocurement.bridge.contracting.databridge.ContractingClient')
+    @patch('openprocurement.bridge.contracting.databridge.INFINITY_LOOP')
+    def test_get_tenders(
+            self, mocked_loop, mocked_contract_client, mocked_tender_client,
+            mocked_sync_client, mocked_db, mocked_logger, mocked_gevent):
+        mocked_db()._backend = 'redis'
+        mocked_db()._db_name = 'cache_db_name'
+        mocked_db()._port = 6379
+        mocked_db()._host = 'localhost'
+
+        info_calls = list()
+        debug_calls = list()
+
+        cb = ContractingDataBridge({'main': {}})
+        # Check initialization
+        msg = "Caching backend: '{}', db name: '{}', host: '{}', " \
+              "port: '{}'".format(
+            cb.cache_db._backend, cb.cache_db._db_name, cb.cache_db._host,
+            cb.cache_db._port
+        )
+        info_calls += [
+            call(msg, extra={'MESSAGE_ID': DATABRIDGE_INFO}),
+            call('Initialization contracting clients.',
+                 extra={'MESSAGE_ID': DATABRIDGE_INFO})
+        ]
+
+        tender_id = self.TENDER_ID
+
+        response = self._fake_response()
+        tenders = [
+            munchify({'id': tender_id, 'procurementMethodType': 'competitiveDialogueUA'}),
+            munchify({'id': tender_id, 'procurementMethodType': 'competitiveDialogueEU'}),
+            munchify({'id': tender_id, 'status': 'pending'}),
+            munchify({'id': tender_id, 'status': 'complete'}),
+            munchify({'id': tender_id, 'status': 'complete',
+                      'lots': [{'status': 'complete'}]}),
+        ]
+        response.data = tenders
+        params = {'descending': True, 'offset': True}
+        direction = self.DIRECTION
+
+        cb.initialize_sync = MagicMock(return_value=response)
+        cb.tenders_sync_client = MagicMock()
+        cb.tenders_sync_client.sync_tenders = MagicMock(return_value=self._fake_response())
+        for _ in cb.get_tenders(params=params, direction=direction):
+            pass
+
+        info_calls += [
+            call("Client {} params: {}".format(direction, params)),
+            call('Skipping {} tender {}'
+                 .format(tenders[0]['procurementMethodType'], tenders[0]['id']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_INFO}, params={"TENDER_ID": tenders[0]['id']})),
+            call('Skipping {} tender {}'
+                 .format(tenders[1]['procurementMethodType'], tenders[1]['id']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_INFO}, params={"TENDER_ID": tenders[1]['id']})),
+            call('{} sync: Found tender in complete status {}'
+                 .format(direction.capitalize(), tenders[3]['id']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_FOUND_NOLOT_COMPLETE},
+                                       {"TENDER_ID": tenders[3]['id']})),
+            call('{} sync: Found multilot tender {} in status {}'
+                 .format(direction.capitalize(), tenders[4]['id'], tenders[4]['status']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_FOUND_MULTILOT_COMPLETE},
+                                       {"TENDER_ID": tenders[4]['id']})),
+            call('Sleep {} sync...'.format(direction), extra=journal_context({"MESSAGE_ID": DATABRIDGE_SYNC_SLEEP})),
+            call('Restore {} sync'.format(direction), extra=journal_context({"MESSAGE_ID": DATABRIDGE_SYNC_RESUME}))
+        ]
+        debug_calls += [
+            call('{} sync: Skipping tender {} in status {}'
+                 .format(direction.capitalize(), tenders[2]['id'], tenders[2]['status']),
+                 extra=journal_context(params={"TENDER_ID": tenders[2]['id']})),
+
+            call('{} {}'.format(direction, params))
+        ]
+
+        self.assertEqual(mocked_logger.debug.mock_calls, debug_calls)
+        self.assertEqual(mocked_logger.info.mock_calls, info_calls)
+
+    def _fake_generator(self, flag, items=None):
+        if flag:
+            for item in items:
+                yield item
+        else:
+            raise Exception()
+
+    @patch('openprocurement.bridge.contracting.databridge.gevent')
+    @patch('openprocurement.bridge.contracting.databridge.logger')
+    @patch('openprocurement.bridge.contracting.databridge.Db')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClientSync')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClient')
+    @patch('openprocurement.bridge.contracting.databridge.ContractingClient')
+    @patch('openprocurement.bridge.contracting.databridge.INFINITY_LOOP')
+    def test_get_tender_contracts_forward(
+            self, mocked_loop, mocked_contract_client, mocked_tender_client,
+            mocked_sync_client, mocked_db, mocked_logger, mocked_gevent):
+        mocked_db()._backend = 'redis'
+        mocked_db()._db_name = 'cache_db_name'
+        mocked_db()._port = 6379
+        mocked_db()._host = 'localhost'
+
+        info_calls = []
+        warn_calls = []
+
+        cb = ContractingDataBridge({'main': {}})
+        # Check initialization
+        msg = "Caching backend: '{}', db name: '{}', host: '{}', " \
+              "port: '{}'".format(
+            cb.cache_db._backend, cb.cache_db._db_name, cb.cache_db._host,
+            cb.cache_db._port
+        )
+        info_calls += [
+            call(msg, extra={'MESSAGE_ID': DATABRIDGE_INFO}),
+            call('Initialization contracting clients.',
+                 extra={'MESSAGE_ID': DATABRIDGE_INFO})
+        ]
+
+        cb.get_tenders = MagicMock(return_value=self._fake_generator(True, [{'id': 'some_id'}]))
+        cb.get_tender_contracts_forward()
+
+        info_calls += [
+            call('Start forward data sync worker...'),
+            call('Forward sync: Put tender {} to process...'.format('some_id'),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS}, {"TENDER_ID": 'some_id'}))
+        ]
+        warn_calls += [
+            call('Forward data sync finished!', extra=journal_context({"MESSAGE_ID": DATABRIDGE_WORKER_DIED}, {}))
+        ]
+
+        cb.get_tenders.return_value = self._fake_generator(False)
+        with self.assertRaises(Exception) as e:
+            cb.get_tender_contracts_forward()
+            mocked_logger.exception.assert_called_once_with(e)
+
+        info_calls += [call('Start forward data sync worker...')]
+        warn_calls += [call('Forward worker died!', extra=journal_context({"MESSAGE_ID": DATABRIDGE_WORKER_DIED}, {}))]
+
+        self.assertEqual(mocked_logger.info.mock_calls, info_calls)
+        self.assertEqual(mocked_logger.warn.mock_calls, warn_calls)
+
+    @patch('openprocurement.bridge.contracting.databridge.gevent')
+    @patch('openprocurement.bridge.contracting.databridge.logger')
+    @patch('openprocurement.bridge.contracting.databridge.Db')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClientSync')
+    @patch('openprocurement.bridge.contracting.databridge.TendersClient')
+    @patch('openprocurement.bridge.contracting.databridge.ContractingClient')
+    @patch('openprocurement.bridge.contracting.databridge.INFINITY_LOOP')
+    def test_get_tender_contracts_backward(
+            self, mocked_loop, mocked_contract_client, mocked_tender_client,
+            mocked_sync_client, mocked_db, mocked_logger, mocked_gevent):
+        mocked_db()._backend = 'redis'
+        mocked_db()._db_name = 'cache_db_name'
+        mocked_db()._port = 6379
+        mocked_db()._host = 'localhost'
+
+        info_calls = []
+
+        cb = ContractingDataBridge({'main': {}})
+        # Check initialization
+        msg = "Caching backend: '{}', db name: '{}', host: '{}', " \
+              "port: '{}'".format(
+            cb.cache_db._backend, cb.cache_db._db_name, cb.cache_db._host,
+            cb.cache_db._port
+        )
+        info_calls += [
+            call(msg, extra={'MESSAGE_ID': DATABRIDGE_INFO}),
+            call('Initialization contracting clients.',
+                 extra={'MESSAGE_ID': DATABRIDGE_INFO})
+        ]
+
+        tenders = [{'id': 'id{}'.format(i), 'dateModified': bool(i % 2)} for i in range(2)]
+        cb.get_tenders = MagicMock(return_value=self._fake_generator(True, tenders))
+        cb.cache_db = MagicMock()
+        cb.cache_db.get = MagicMock(return_value=True)
+        cb.get_tender_contracts_backward()
+
+        info_calls += [
+            call('Start backward data sync worker...'),
+            call('Backward sync: Put tender {} to process...'.format(tenders[0]['id']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS}, {"TENDER_ID": tenders[0]['id']})),
+            call('Tender {} not modified from last check. Skipping'.format(tenders[1]['id']),
+                 extra=journal_context({"MESSAGE_ID": DATABRIDGE_SKIP_NOT_MODIFIED}, {"TENDER_ID": tenders[1]['id']})),
+            call('Backward data sync finished.')
+        ]
+
+        cb.get_tenders.return_value = self._fake_generator(False)
+        with self.assertRaises(Exception) as e:
+            cb.get_tender_contracts_backward()
+            mocked_logger.exception.assert_called_once_with(e)
+
+        info_calls += [call('Start backward data sync worker...')]
+        mocked_logger.warn.assert_called_once_with('Backward worker died!',
+                                                   extra=journal_context({"MESSAGE_ID": DATABRIDGE_WORKER_DIED}, {}))
+        self.assertEqual(mocked_logger.info.mock_calls, info_calls)
 
 def suite():
     suite = unittest.TestSuite()
